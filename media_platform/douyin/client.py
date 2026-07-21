@@ -20,12 +20,15 @@
 import asyncio
 import copy
 import json
+import re
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
 
 import httpx
+import requests
 from playwright.async_api import BrowserContext
 
+import config
 from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
@@ -65,6 +68,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        self._browser_info: Optional[Dict] = None
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -80,6 +84,27 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             return
         headers = headers or self.headers
         local_storage: Dict = await self.playwright_page.evaluate("() => window.localStorage")  # type: ignore
+        if self._browser_info is None:
+            try:
+                self._browser_info = await self.playwright_page.evaluate(  # type: ignore
+                    """() => ({
+                        userAgent: navigator.userAgent,
+                        language: navigator.language,
+                        platform: navigator.platform,
+                        hardwareConcurrency: navigator.hardwareConcurrency,
+                        deviceMemory: navigator.deviceMemory,
+                        screenWidth: screen.width,
+                        screenHeight: screen.height
+                    })"""
+                )
+            except Exception:
+                self._browser_info = {}
+        browser_info = self._browser_info
+        user_agent = str(browser_info.get("userAgent") or headers.get("User-Agent") or "")
+        version_match = re.search(r"(?:Chrome|Edg)/([\d.]+)", user_agent)
+        browser_version = version_match.group(1) if version_match else "125.0.0.0"
+        browser_platform = str(browser_info.get("platform") or "Win32")
+        is_windows = browser_platform.lower().startswith("win") or "Windows" in user_agent
         common_params = {
             "device_platform": "webapp",
             "aid": "6383",
@@ -89,24 +114,24 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "update_version_code": "170400",
             "pc_client_type": "1",
             "cookie_enabled": "true",
-            "browser_language": "zh-CN",
-            "browser_platform": "MacIntel",
+            "browser_language": str(browser_info.get("language") or "zh-CN"),
+            "browser_platform": browser_platform,
             "browser_name": "Chrome",
-            "browser_version": "125.0.0.0",
+            "browser_version": browser_version,
             "browser_online": "true",
             "engine_name": "Blink",
-            "os_name": "Mac OS",
-            "os_version": "10.15.7",
-            "cpu_core_num": "8",
-            "device_memory": "8",
+            "os_name": "Windows" if is_windows else "Mac OS",
+            "os_version": "10" if is_windows else "10.15.7",
+            "cpu_core_num": str(browser_info.get("hardwareConcurrency") or "8"),
+            "device_memory": str(browser_info.get("deviceMemory") or "8"),
             "engine_version": "109.0",
             "platform": "PC",
-            "screen_width": "2560",
-            "screen_height": "1440",
+            "screen_width": str(browser_info.get("screenWidth") or "2560"),
+            "screen_height": str(browser_info.get("screenHeight") or "1440"),
             'effective_type': '4g',
             "round_trip_time": "50",
-            "webid": get_web_id(),
-            "msToken": local_storage.get("xmst"),
+            "webid": local_storage.get("webid") or local_storage.get("webId") or get_web_id(),
+            "msToken": local_storage.get("xmst") or self.cookie_dict.get("msToken"),
         }
         params.update(common_params)
         query_string = urllib.parse.urlencode(params)
@@ -126,13 +151,48 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
+        if response.text.strip() in {"", "blocked"}:
+            utils.logger.warning(
+                "[DouYinClient.request] httpx returned empty/blocked response "
+                f"(status={response.status_code}); retrying with requests transport"
+            )
+            try:
+                response = await asyncio.to_thread(
+                    self._request_with_requests,
+                    method,
+                    url,
+                    kwargs,
+                )
+            except requests.RequestException as ex:
+                raise DataFetchError(
+                    f"Douyin requests transport failed: {type(ex).__name__}: {ex}"
+                ) from ex
         try:
-            if response.text == "" or response.text == "blocked":
-                utils.logger.error(f"request params incrr, response.text: {response.text}")
+            if response.text.strip() in {"", "blocked"}:
+                utils.logger.error(
+                    "[DouYinClient.request] Both HTTP transports returned an "
+                    f"empty/blocked response (status={response.status_code}, url={url})"
+                )
                 raise Exception("account blocked")
             return response.json()
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
+
+    def _request_with_requests(self, method: str, url: str, kwargs: Dict):
+        request_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in {"params", "headers", "data", "json", "cookies"}
+        }
+        request_kwargs["timeout"] = self.timeout
+        request_kwargs["verify"] = not getattr(config, "DISABLE_SSL_VERIFY", False)
+        if "follow_redirects" in kwargs:
+            request_kwargs["allow_redirects"] = kwargs["follow_redirects"]
+        if self.proxy:
+            request_kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.request(method, url, **request_kwargs)
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
         """
@@ -316,7 +376,9 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "publish_video_strategy_type": 2,
             "personal_center_strategy": 1,
         }
-        return await self.get(uri, params)
+        headers = copy.copy(self.headers)
+        headers["Referer"] = f"https://www.douyin.com/user/{sec_user_id}"
+        return await self.get(uri, params, headers=headers)
 
     async def get_user_aweme_posts(self, sec_user_id: str, max_cursor: str = "") -> Dict:
         uri = "/aweme/v1/web/aweme/post/"
@@ -327,21 +389,37 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "locate_query": "false",
             "publish_video_strategy_type": 2,
         }
-        return await self.get(uri, params)
+        headers = copy.copy(self.headers)
+        headers["Referer"] = f"https://www.douyin.com/user/{sec_user_id}"
+        return await self.get(uri, params, headers=headers)
 
-    async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
+    async def get_all_user_aweme_posts(
+        self,
+        sec_user_id: str,
+        callback: Optional[Callable] = None,
+        max_count: int = 0,
+    ):
         posts_has_more = 1
         max_cursor = ""
         result = []
-        while posts_has_more == 1:
+        while posts_has_more == 1 and (max_count <= 0 or len(result) < max_count):
             aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor)
             posts_has_more = aweme_post_res.get("has_more", 0)
-            max_cursor = aweme_post_res.get("max_cursor")
+            next_cursor = aweme_post_res.get("max_cursor")
             aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
+            if max_count > 0:
+                aweme_list = aweme_list[: max_count - len(result)]
             utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
             if callback:
                 await callback(aweme_list)
             result.extend(aweme_list)
+            if posts_has_more == 1 and next_cursor == max_cursor and not aweme_list:
+                utils.logger.warning(
+                    "[DouYinClient.get_all_user_aweme_posts] Empty page with unchanged "
+                    f"cursor for sec_user_id={sec_user_id}; stop pagination"
+                )
+                break
+            max_cursor = next_cursor
         return result
 
     async def get_aweme_media(self, url: str) -> Union[bytes, None]:

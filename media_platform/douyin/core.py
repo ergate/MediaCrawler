@@ -300,12 +300,42 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.error(f"[DouYinCrawler.get_creators_and_videos] Failed to parse creator URL: {e}")
                 continue
 
-            creator_info: Dict = await self.dy_client.get_user_info(user_id)
-            if creator_info:
-                await douyin_store.save_creator(user_id, creator=creator_info)
+            try:
+                await self.context_page.goto(
+                    creator_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(os.environ.get("MEDIACRAWLER_DY_CREATOR_PAGE_TIMEOUT", "15000")),
+                )
+                await self.dy_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
+                utils.logger.info(
+                    "[BrowserReady] Douyin creator page loaded and cookies refreshed; "
+                    f"sec_user_id={user_id}"
+                )
+            except Exception as ex:
+                utils.logger.warning(
+                    "[DouYinCrawler.get_creators_and_videos] Creator page preparation "
+                    f"failed; continue with current session: {ex}"
+                )
+
+            try:
+                creator_info: Dict = await self.dy_client.get_user_info(user_id)
+                if creator_info:
+                    await douyin_store.save_creator(user_id, creator=creator_info)
+            except DataFetchError as ex:
+                utils.logger.warning(
+                    "[DouYinCrawler.get_creators_and_videos] Creator profile request "
+                    f"failed; continue with posts: {ex}"
+                )
 
             # Get all video information of the creator
-            all_video_list = await self.dy_client.get_all_user_aweme_posts(sec_user_id=user_id, callback=self.fetch_creator_video_detail)
+            all_video_list = await self.dy_client.get_all_user_aweme_posts(
+                sec_user_id=user_id,
+                callback=self.fetch_creator_video_detail,
+                max_count=max(int(config.CRAWLER_MAX_NOTES_COUNT), 1),
+            )
 
             video_ids = [video_item.get("aweme_id") for video_item in all_video_list]
             await self.batch_get_note_comments(video_ids)
