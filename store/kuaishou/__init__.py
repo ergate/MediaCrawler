@@ -58,6 +58,7 @@ async def update_kuaishou_video(video_item: Dict):
     if not video_id:
         return
     user_info = video_item.get("author", {})
+    comment_count = photo_info.get("commentCount")
     save_content_item = {
         "video_id": video_id,
         "video_type": str(video_item.get("type")),
@@ -67,6 +68,7 @@ async def update_kuaishou_video(video_item: Dict):
         "creator_hash": anonymize_user_id(user_info.get("id")),  # 创作者匿名哈希(不存原始 user_id)
         "nickname": mask_nickname(user_info.get("name")),  # 用户昵称(已脱敏)
         "liked_count": str(photo_info.get("realLikeCount")),
+        "comment_count": "" if comment_count is None else str(comment_count),
         "viewd_count": str(photo_info.get("viewCount")),
         "last_modify_ts": utils.get_current_timestamp(),
         "video_url": f"https://www.kuaishou.com/short-video/{video_id}",

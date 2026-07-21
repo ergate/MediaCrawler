@@ -52,6 +52,7 @@ def make_mock_video() -> dict:
             "coverUrl": "https://p.kuaishou.com/cover/abc.jpg",
             "photoUrl": "https://v.kuaishou.com/play/abc.mp4",
             "realLikeCount": 12345,
+            "commentCount": 321,
             "viewCount": 67890,
         },
         "author": {
@@ -157,6 +158,7 @@ def test_kuaishou_video_masks_user_info():
     assert captured["video_type"] == "1"
     # 计数字段被 str() 化
     assert captured["liked_count"] == "12345"
+    assert captured["comment_count"] == "321"
     assert captured["viewd_count"] == "67890"
 
 

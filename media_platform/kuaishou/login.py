@@ -32,6 +32,20 @@ from base.base_crawler import AbstractLogin
 from tools import utils
 
 
+KS_AUTH_COOKIE_NAMES = {
+    "passToken",
+    "userId",
+    "kuaishou.api_st",
+    "kuaishou.server.web_st",
+    "kuaishou.web.cp.api_st",
+}
+
+
+def has_kuaishou_auth_cookie(cookie_dict: dict) -> bool:
+    """Exclude anonymous device cookies such as did."""
+    return any(cookie_dict.get(name) for name in KS_AUTH_COOKIE_NAMES)
+
+
 class KuaishouLogin(AbstractLogin):
     def __init__(self,
                  login_type: str,
@@ -67,10 +81,7 @@ class KuaishouLogin(AbstractLogin):
         """
         current_cookie = await self.browser_context.cookies()
         _, cookie_dict = utils.convert_cookies(current_cookie)
-        kuaishou_pass_token = cookie_dict.get("passToken")
-        if kuaishou_pass_token:
-            return True
-        return False
+        return has_kuaishou_auth_cookie(cookie_dict)
 
     async def login_by_qrcode(self):
         """login kuaishou website and keep webdriver login state"""
@@ -80,6 +91,15 @@ class KuaishouLogin(AbstractLogin):
         login_button_ele = self.context_page.locator(
             "xpath=//p[text()='登录']"
         )
+        if (
+            await login_button_ele.count() == 0
+            or not await login_button_ele.first.is_visible(timeout=2000)
+        ):
+            if await self.browser_login_state_looks_valid():
+                utils.logger.info(
+                    "[KuaishouLogin.login_by_qrcode] Login button not visible, current browser session looks logged in."
+                )
+                return
         await login_button_ele.click()
 
         # find login qrcode
@@ -107,6 +127,17 @@ class KuaishouLogin(AbstractLogin):
         wait_redirect_seconds = 5
         utils.logger.info(f"[KuaishouLogin.login_by_qrcode] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
         await asyncio.sleep(wait_redirect_seconds)
+
+    async def browser_login_state_looks_valid(self) -> bool:
+        try:
+            current_cookie = await self.browser_context.cookies()
+            _, cookie_dict = utils.convert_cookies(current_cookie)
+            return has_kuaishou_auth_cookie(cookie_dict)
+        except Exception as ex:
+            utils.logger.warning(
+                f"[KuaishouLogin.browser_login_state_looks_valid] Could not verify browser login state: {ex}"
+            )
+            return False
 
     async def login_by_mobile(self):
         pass

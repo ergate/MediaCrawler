@@ -136,6 +136,7 @@ class KuaishouVideo(Base):
     desc = Column(Text, comment='视频描述')
     create_time = Column(BigInteger, index=True, comment='创建时间戳')
     liked_count = Column(Text, comment='点赞数')
+    comment_count = Column(Text, comment='评论数')
     viewd_count = Column(Text, comment='观看数')
     video_url = Column(Text, comment='视频URL')
     video_cover_url = Column(Text, comment='视频封面URL')

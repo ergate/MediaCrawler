@@ -138,10 +138,10 @@ def get_mobile_user_agent() -> str:
 def convert_cookies(cookies: Optional[List[Cookie]]) -> Tuple[str, Dict]:
     if not cookies:
         return "", {}
-    cookies_str = ";".join([f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies])
+    cookies_str = ";".join([f"{cookie.get('name')}={str(cookie.get('value') or '')}" for cookie in cookies])
     cookie_dict = dict()
     for cookie in cookies:
-        cookie_dict[cookie.get('name')] = cookie.get('value')
+        cookie_dict[cookie.get('name')] = str(cookie.get('value') or '')
     return cookies_str, cookie_dict
 
 

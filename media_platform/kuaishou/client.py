@@ -21,6 +21,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import json
+import os
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -52,7 +53,7 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
         proxy_ip_pool: Optional["ProxyIpPool"] = None,
     ):
         self.proxy = proxy
-        self.timeout = timeout
+        self.timeout = float(os.environ.get("MEDIACRAWLER_KS_REQUEST_TIMEOUT") or timeout)
         self.headers = headers
         self._host = "https://www.kuaishou.com/graphql"
         self._rest_host = "https://www.kuaishou.com"
@@ -60,20 +61,76 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
         self.graphql = KuaiShouGraphQL()
+        self.last_pong_unauthenticated = False
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    @staticmethod
+    def _photo_publish_ts(item: Dict) -> int:
+        try:
+            photo = item.get("photo") if isinstance(item, dict) else None
+            photo = photo if isinstance(photo, dict) else {}
+            ts = int(
+                photo.get("timestamp")
+                or photo.get("createTime")
+                or photo.get("create_time")
+                or item.get("timestamp")
+                or item.get("createTime")
+                or item.get("create_time")
+                or 0
+            )
+            return int(ts / 1000) if ts > 10_000_000_000 else ts
+        except (TypeError, ValueError):
+            return 0
 
     async def request(self, method, url, **kwargs) -> Any:
         # Check if proxy is expired before each request
         await self._refresh_proxy_if_expired()
 
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(method, url, timeout=self.timeout, **kwargs)
-        data: Dict = response.json()
+        try:
+            async with make_async_client(proxy=self.proxy) as client:
+                response = await client.request(method, url, timeout=self.timeout, **kwargs)
+            data: Dict = response.json()
+        except Exception as ex:
+            utils.logger.warning(
+                f"[KuaiShouClient.request] httpx request failed, fallback to browser fetch: {ex}"
+            )
+            data = await self.request_with_browser_fetch(method, url, **kwargs)
         if data.get("errors"):
             raise DataFetchError(data.get("errors", "unkonw error"))
         else:
             return data.get("data", {})
+
+    async def request_with_browser_fetch(self, method: str, url: str, **kwargs) -> Dict:
+        """Retry an API request inside the authenticated browser session."""
+        headers = dict(kwargs.get("headers") or self.headers or {})
+        headers.pop("Cookie", None)
+        headers.pop("cookie", None)
+        result = await self.playwright_page.evaluate(
+            """async ({ method, url, headers, body }) => {
+                const response = await fetch(url, {
+                    method,
+                    headers,
+                    body,
+                    credentials: "include"
+                });
+                const text = await response.text();
+                try {
+                    return JSON.parse(text);
+                } catch (error) {
+                    return { errors: `Non-JSON response: ${text.slice(0, 200)}` };
+                }
+            }""",
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "body": kwargs.get("data"),
+            },
+        )
+        if not isinstance(result, dict):
+            return {"errors": "browser fetch returned non-dict result"}
+        return result
 
     async def get(self, uri: str, params=None) -> Dict:
         final_uri = uri
@@ -99,15 +156,27 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
         await self._refresh_proxy_if_expired()
 
         json_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(
-                method="POST",
-                url=f"{self._rest_host}{uri}",
+        url = f"{self._rest_host}{uri}"
+        try:
+            async with make_async_client(proxy=self.proxy) as client:
+                response = await client.request(
+                    method="POST",
+                    url=url,
+                    data=json_str,
+                    timeout=self.timeout,
+                    headers=self.headers,
+                )
+            result: Dict = response.json()
+        except Exception as ex:
+            utils.logger.warning(
+                f"[KuaiShouClient.request_rest_v2] httpx request failed, fallback to browser fetch: {ex}"
+            )
+            result = await self.request_with_browser_fetch(
+                "POST",
+                url,
                 data=json_str,
-                timeout=self.timeout,
                 headers=self.headers,
             )
-        result: Dict = response.json()
         if result.get("result") != 1:
             raise DataFetchError(f"REST API V2 error: {result}")
         return result
@@ -115,6 +184,7 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
     async def pong(self) -> bool:
         """get a note to check if login state is ok"""
         utils.logger.info("[KuaiShouClient.pong] Begin pong kuaishou...")
+        self.last_pong_unauthenticated = False
         ping_flag = False
         try:
             post_data = {
@@ -128,6 +198,10 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
             if res.get("visionProfileUserList", {}).get("result") == 1:
                 ping_flag = True
         except Exception as e:
+            error_text = str(e).lower()
+            self.last_pong_unauthenticated = (
+                "unauthenticated" in error_text or "no login" in error_text
+            )
             utils.logger.error(
                 f"[KuaiShouClient.pong] Pong kuaishou failed: {e}, and try to login again..."
             )
@@ -188,6 +262,17 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
             "pcursor": pcursor,
         }
         return await self.request_rest_v2("/rest/v/photo/comment/list", post_data)
+
+    async def get_video_comment_count(self, photo_id: str) -> Optional[int]:
+        """Fetch only the comment total and discard returned comment rows."""
+        comments_res = await self.get_video_comments(photo_id, "")
+        value = comments_res.get("commentCountV2")
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def get_video_sub_comments(
         self, photo_id: str, root_comment_id: int, pcursor: str = ""
@@ -335,7 +420,9 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
         result = []
         pcursor = ""
 
-        while pcursor != "no_more":
+        min_publish_ts = int(os.environ.get("MEDIACRAWLER_MIN_PUBLISH_TS") or "0")
+        max_count = max(int(config.CRAWLER_MAX_NOTES_COUNT), 1)
+        while pcursor != "no_more" and len(result) < max_count:
             videos_res = await self.get_video_by_creater(user_id, pcursor)
             if not videos_res:
                 utils.logger.error(
@@ -346,13 +433,27 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
             vision_profile_photo_list = videos_res.get("visionProfilePhotoList", {})
             pcursor = vision_profile_photo_list.get("pcursor", "")
 
-            videos = vision_profile_photo_list.get("feeds", [])
+            videos = vision_profile_photo_list.get("feeds", []) or []
             utils.logger.info(
                 f"[KuaiShouClient.get_all_videos_by_creator] got user_id:{user_id} videos len : {len(videos)}"
             )
 
-            if callback:
-                await callback(videos)
+            filtered_videos: List[Dict] = []
+            older_seen = False
+            remaining = max_count - len(result)
+            for video in videos:
+                publish_ts = self._photo_publish_ts(video)
+                if min_publish_ts and publish_ts and publish_ts < min_publish_ts:
+                    older_seen = True
+                    continue
+                filtered_videos.append(video)
+                if len(filtered_videos) >= remaining:
+                    break
+
+            if callback and filtered_videos:
+                await callback(filtered_videos)
             await asyncio.sleep(crawl_interval)
-            result.extend(videos)
+            result.extend(filtered_videos)
+            if older_seen:
+                break
         return result

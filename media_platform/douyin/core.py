@@ -95,7 +95,16 @@ class DouYinCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            try:
+                await self.context_page.goto(
+                    self.index_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(os.environ.get("MEDIACRAWLER_DY_PAGE_TIMEOUT", "15000")),
+                )
+            except Exception as ex:
+                utils.logger.warning(
+                    f"[DouYinCrawler.start] Douyin home page navigation timed out, continue with current browser session: {ex}"
+                )
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             if not await self.dy_client.pong(browser_context=self.browser_context):
@@ -312,10 +321,11 @@ class DouYinCrawler(AbstractCrawler):
             self.browser_context,
             urls=self.cookie_urls,
         )  # type: ignore
+        user_agent = await self.get_browser_user_agent()
         douyin_client = DouYinClient(
             proxy=httpx_proxy,
             headers={
-                "User-Agent": await self.context_page.evaluate("() => navigator.userAgent"),
+                "User-Agent": user_agent,
                 "Cookie": cookie_str,
                 "Host": "www.douyin.com",
                 "Origin": "https://www.douyin.com/",
@@ -327,6 +337,38 @@ class DouYinCrawler(AbstractCrawler):
             proxy_ip_pool=self.ip_proxy_pool,  # Pass proxy pool for automatic refresh
         )
         return douyin_client
+
+    async def get_browser_user_agent(self) -> str:
+        """Read the browser UA after Douyin redirects have settled."""
+        attempts = max(
+            int(os.environ.get("MEDIACRAWLER_DY_EVALUATE_RETRIES", "8")),
+            1,
+        )
+        retry_delay = max(
+            float(os.environ.get("MEDIACRAWLER_DY_EVALUATE_RETRY_DELAY", "1")),
+            0,
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.context_page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=int(
+                        os.environ.get("MEDIACRAWLER_DY_PAGE_TIMEOUT", "15000")
+                    ),
+                )
+                return await self.context_page.evaluate(
+                    "() => navigator.userAgent"
+                )
+            except Exception as ex:
+                if attempt >= attempts:
+                    raise
+                utils.logger.warning(
+                    "[DouYinCrawler.get_browser_user_agent] Browser navigation "
+                    f"interrupted User-Agent read ({attempt}/{attempts}): {ex}"
+                )
+                await asyncio.sleep(retry_delay)
+
+        raise RuntimeError("Could not read browser User-Agent")
 
     async def launch_browser(
         self,

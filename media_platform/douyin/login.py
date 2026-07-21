@@ -20,6 +20,7 @@
 
 import asyncio
 import functools
+import os
 import sys
 from typing import Optional
 
@@ -35,6 +36,12 @@ from tools import utils
 
 
 class DouYinLogin(AbstractLogin):
+    LOGIN_SURFACE_SELECTORS = (
+        ("second verification", "#uc-second-verify"),
+        ("QR code panel", "#animate_qrcode_container"),
+        ("new login panel", "[id^='login-full-panel-']"),
+        ("legacy login panel", "#login-panel-new"),
+    )
 
     def __init__(self,
                  login_type: str,
@@ -110,19 +117,68 @@ class DouYinLogin(AbstractLogin):
 
     async def popup_login_dialog(self):
         """If the login dialog box does not pop up automatically, we will manually click the login button"""
-        dialog_selector = "xpath=//div[@id='login-panel-new']"
-        try:
-            # check dialog box is auto popup and wait for 10 seconds
-            await self.context_page.wait_for_selector(dialog_selector, timeout=1000 * 10)
-        except Exception as e:
-            utils.logger.error(f"[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, error: {e}")
-            utils.logger.info("[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, we will manually click the login button")
-            login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']")
-            await login_button_ele.click()
+        for _ in range(20):
+            surface = await self.visible_login_surface()
+            if surface:
+                utils.logger.info(
+                    f"[DouYinLogin.popup_login_dialog] Detected active {surface}"
+                )
+                return
             await asyncio.sleep(0.5)
+
+        utils.logger.info(
+            "[DouYinLogin.popup_login_dialog] Login surface is not visible; click the login button"
+        )
+        login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']")
+        try:
+            await login_button_ele.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            # The login panel can appear while Playwright is retrying the click.
+            surface = await self.visible_login_surface()
+            if surface:
+                utils.logger.info(
+                    f"[DouYinLogin.popup_login_dialog] Detected active {surface} after click was intercepted"
+                )
+                return
+            raise
+        await asyncio.sleep(0.5)
+
+    async def visible_login_surface(self) -> str:
+        """Return the currently visible login or verification surface."""
+        for name, selector in self.LOGIN_SURFACE_SELECTORS:
+            try:
+                locator = self.context_page.locator(selector)
+                if (
+                    await locator.count() > 0
+                    and await locator.first.is_visible(timeout=500)
+                ):
+                    return name
+            except Exception:
+                continue
+        return ""
 
     async def login_by_qrcode(self):
         utils.logger.info("[DouYinLogin.login_by_qrcode] Begin login douyin by qrcode...")
+        if await self.visible_login_surface() == "second verification":
+            timeout_ms = int(
+                os.environ.get("MEDIACRAWLER_DY_MANUAL_VERIFY_TIMEOUT", "180000")
+            )
+            utils.logger.info(
+                "[DouYinLogin.login_by_qrcode] Complete the visible second verification "
+                f"in the browser within {int(timeout_ms / 1000)} seconds"
+            )
+            try:
+                await self.context_page.wait_for_selector(
+                    "#uc-second-verify",
+                    state="hidden",
+                    timeout=timeout_ms,
+                )
+            except PlaywrightTimeoutError as ex:
+                raise RuntimeError(
+                    "Douyin second verification was not completed before timeout"
+                ) from ex
+            return
+
         qrcode_img_selector = "xpath=//div[@id='animate_qrcode_container']//img"
         base64_qrcode_img = await utils.find_login_qrcode(
             self.context_page,

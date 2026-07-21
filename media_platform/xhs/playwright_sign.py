@@ -23,12 +23,16 @@
 # 许可协议: MIT License
 
 import hashlib
+import inspect
 import json
 import time
 from typing import Any, Dict, Optional, Union
 from urllib.parse import quote
 
 from .xhs_sign import get_trace_id
+
+
+_XHSHOW_BUILD_HAS_HEX_MD5_PATH = False
 
 
 def _patch_xhshow_a3_hash():
@@ -45,12 +49,18 @@ def _patch_xhshow_a3_hash():
     """
     from xhshow.core.crypto import CryptoProcessor
 
+    global _XHSHOW_BUILD_HAS_HEX_MD5_PATH
     _original_build = CryptoProcessor.build_payload_array
+    original_signature = inspect.signature(_original_build)
+    _XHSHOW_BUILD_HAS_HEX_MD5_PATH = (
+        "hex_md5_path" in original_signature.parameters
+    )
 
-    def _patched_build(self, hex_parameter, a1_value, app_identifier="xhs-pc-web",
-                       string_param="", timestamp=None, sign_state=None):
-        payload = _original_build(self, hex_parameter, a1_value, app_identifier,
-                                  string_param, timestamp, sign_state)
+    def _patched_build(self, hex_parameter, *args, **kwargs):
+        bound = original_signature.bind(self, hex_parameter, *args, **kwargs)
+        bound.apply_defaults()
+        string_param = bound.arguments.get("string_param", "")
+        payload = _original_build(self, hex_parameter, *args, **kwargs)
         # 仅当 content_string 不含 "{" 时修复 (即 GET 请求)
         if "{" not in string_param:
             correct_md5_hex = hashlib.md5(string_param.encode("utf-8")).hexdigest()
@@ -142,15 +152,23 @@ def sign_with_xhshow(
     else:
         # GET 请求: 构建完整的 content_string 用于签名
         content_string = _build_sign_string(uri, data, method)
-        cookie_dict = xhshow_client._parse_cookies(cookie_str)
+        cookie_dict = {
+            str(key): str(value or "")
+            for key, value in xhshow_client._parse_cookies(cookie_str).items()
+        }
         a1_value = cookie_dict.get("a1", "")
 
         ts = time.time()
         d_value = hashlib.md5(content_string.encode("utf-8")).hexdigest()
 
-        payload_array = xhshow_client.crypto_processor.build_payload_array(
-            d_value, a1_value, "xhs-pc-web", content_string, ts
-        )
+        if _XHSHOW_BUILD_HAS_HEX_MD5_PATH:
+            payload_array = xhshow_client.crypto_processor.build_payload_array(
+                d_value, d_value, a1_value, "xhs-pc-web", content_string, ts
+            )
+        else:
+            payload_array = xhshow_client.crypto_processor.build_payload_array(
+                d_value, a1_value, "xhs-pc-web", content_string, ts
+            )
         xor_result = xhshow_client.crypto_processor.bit_ops.xor_transform_array(payload_array)
         config = xhshow_client.config
         x3_b64 = xhshow_client.crypto_processor.b64encoder.encode_x3(

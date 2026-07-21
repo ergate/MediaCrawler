@@ -232,7 +232,7 @@ class CDPBrowserManager:
             # Simple socket connection test
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(5)
-                result = s.connect_ex(("localhost", debug_port))
+                result = s.connect_ex(("127.0.0.1", debug_port))
                 if result == 0:
                     utils.logger.info(
                         f"[CDPBrowserManager] CDP port {debug_port} is accessible"
@@ -289,26 +289,36 @@ class CDPBrowserManager:
         """
         Get browser WebSocket connection URL
         """
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"http://localhost:{debug_port}/json/version", timeout=10
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 6):
+            try:
+                # Local CDP traffic must never be sent through HTTP_PROXY/ALL_PROXY.
+                async with httpx.AsyncClient(trust_env=False) as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{debug_port}/json/version", timeout=10
+                    )
+                response.raise_for_status()
+                ws_url = response.json().get("webSocketDebuggerUrl")
+                if not ws_url:
+                    raise RuntimeError("webSocketDebuggerUrl not found")
+                utils.logger.info(
+                    f"[CDPBrowserManager] Got browser WebSocket URL: {ws_url}"
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    ws_url = data.get("webSocketDebuggerUrl")
-                    if ws_url:
-                        utils.logger.info(
-                            f"[CDPBrowserManager] Got browser WebSocket URL: {ws_url}"
-                        )
-                        return ws_url
-                    else:
-                        raise RuntimeError("webSocketDebuggerUrl not found")
-                else:
-                    raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] Failed to get WebSocket URL: {e}")
-            raise
+                return ws_url
+            except Exception as exc:
+                last_error = exc
+                if attempt < 5:
+                    utils.logger.warning(
+                        f"[CDPBrowserManager] WebSocket discovery attempt {attempt}/5 failed: {exc}"
+                    )
+                    await asyncio.sleep(0.5)
+
+        utils.logger.error(
+            f"[CDPBrowserManager] Failed to get WebSocket URL: {last_error}"
+        )
+        raise RuntimeError(
+            f"Failed to discover browser WebSocket URL on port {debug_port}: {last_error}"
+        ) from last_error
 
     async def _connect_via_cdp(self, playwright: Playwright):
         """
@@ -316,25 +326,24 @@ class CDPBrowserManager:
         """
         try:
             if config.CDP_CONNECT_EXISTING:
-                # Existing browser remote debugging in Chrome 136+ does not expose
-                # /json/version. Connect directly and wait for user confirmation.
-                ws_url = f"ws://localhost:{self.debug_port}/devtools/browser"
-                utils.logger.info(f"[CDPBrowserManager] Connecting to existing browser via CDP: {ws_url}")
-                utils.logger.info(
-                    "[CDPBrowserManager] Please check your browser for a confirmation dialog and accept it"
-                )
                 try:
-                    self.browser = await playwright.chromium.connect_over_cdp(
-                        ws_url, timeout=config.BROWSER_LAUNCH_TIMEOUT * 1000
-                    )
-                except Exception as direct_error:
-                    utils.logger.warning(
-                        "[CDPBrowserManager] Direct existing-browser CDP connection failed: "
-                        f"{direct_error}. Trying /json/version discovery..."
-                    )
                     ws_url = await self._get_browser_websocket_url(self.debug_port)
                     utils.logger.info(
                         f"[CDPBrowserManager] Connecting to existing browser via discovered CDP: {ws_url}"
+                    )
+                    self.browser = await playwright.chromium.connect_over_cdp(
+                        ws_url, timeout=config.BROWSER_LAUNCH_TIMEOUT * 1000
+                    )
+                except Exception as discovery_error:
+                    # Chrome 136+ may hide /json/version for a browser enabled from
+                    # chrome://inspect. The direct endpoint then requires confirmation.
+                    ws_url = f"ws://127.0.0.1:{self.debug_port}/devtools/browser"
+                    utils.logger.warning(
+                        "[CDPBrowserManager] Existing-browser discovery failed: "
+                        f"{discovery_error}. Trying direct CDP connection..."
+                    )
+                    utils.logger.info(
+                        "[CDPBrowserManager] Please accept the remote debugging confirmation in Chrome"
                     )
                     self.browser = await playwright.chromium.connect_over_cdp(
                         ws_url, timeout=config.BROWSER_LAUNCH_TIMEOUT * 1000

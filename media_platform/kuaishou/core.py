@@ -45,7 +45,7 @@ from var import comment_tasks_var, crawler_type_var, source_keyword_var
 from .client import KuaiShouClient
 from .exception import DataFetchError
 from .help import parse_video_info_from_url, parse_creator_info_from_url
-from .login import KuaishouLogin
+from .login import KuaishouLogin, has_kuaishou_auth_cookie
 
 
 class KuaishouCrawler(AbstractCrawler):
@@ -60,6 +60,12 @@ class KuaishouCrawler(AbstractCrawler):
         self.user_agent = utils.get_user_agent()
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool, used for automatic proxy refresh
+
+    @staticmethod
+    def metric_value_present(value) -> bool:
+        if value in (None, ""):
+            return False
+        return str(value).strip().lower() not in {"none", "null", "undefined"}
 
     async def start(self):
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -94,23 +100,48 @@ class KuaishouCrawler(AbstractCrawler):
 
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(f"{self.index_url}?isHome=1")
+            try:
+                await self.context_page.goto(
+                    f"{self.index_url}?isHome=1",
+                    wait_until="domcontentloaded",
+                    timeout=int(os.environ.get("MEDIACRAWLER_KS_PAGE_TIMEOUT", "15000")),
+                )
+            except Exception as ex:
+                utils.logger.warning(
+                    f"[KuaishouCrawler.start] Kuaishou home page navigation timed out, continue with current browser session: {ex}"
+                )
 
             # Create a client to interact with the kuaishou website.
             self.ks_client = await self.create_ks_client(httpx_proxy_format)
             if not await self.ks_client.pong():
-                login_obj = KuaishouLogin(
-                    login_type=config.LOGIN_TYPE,
-                    login_phone=httpx_proxy_format,
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    cookie_str=config.COOKIES,
-                )
-                await login_obj.begin()
                 await self.ks_client.update_cookies(
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+                if (
+                    not self.ks_client.last_pong_unauthenticated
+                    and await self.browser_login_state_looks_valid()
+                ):
+                    utils.logger.info(
+                        "[KuaishouCrawler.start] Pong failed, but browser login state looks valid; continue with current session."
+                    )
+                else:
+                    if self.ks_client.last_pong_unauthenticated:
+                        utils.logger.info(
+                            "[KuaishouCrawler.start] API explicitly reported no login; start interactive login."
+                        )
+                    login_obj = KuaishouLogin(
+                        login_type=config.LOGIN_TYPE,
+                        login_phone=httpx_proxy_format,
+                        browser_context=self.browser_context,
+                        context_page=self.context_page,
+                        cookie_str=config.COOKIES,
+                    )
+                    await login_obj.begin()
+                    await self.ks_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -129,20 +160,17 @@ class KuaishouCrawler(AbstractCrawler):
 
     async def search(self):
         utils.logger.info("[KuaishouCrawler.search] Begin search kuaishou keywords")
-        ks_limit_count = 20  # kuaishou limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < ks_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = ks_limit_count
+        requested_count = max(int(config.CRAWLER_MAX_NOTES_COUNT), 1)
         start_page = config.START_PAGE
         for keyword in config.KEYWORDS.split(","):
             search_session_id = ""
+            collected_count = 0
             source_keyword_var.set(keyword)
             utils.logger.info(
                 f"[KuaishouCrawler.search] Current search keyword: {keyword}"
             )
             page = 1
-            while (
-                page - start_page + 1
-            ) * ks_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while collected_count < requested_count:
                 if page < start_page:
                     utils.logger.info(f"[KuaishouCrawler.search] Skip page: {page}")
                     page += 1
@@ -169,9 +197,15 @@ class KuaishouCrawler(AbstractCrawler):
                     )
                     break
                 search_session_id = vision_search_photo.get("searchSessionId", "")
-                for video_detail in vision_search_photo.get("feeds"):
-                    video_id_list.append(video_detail.get("photo", {}).get("id"))
+                feeds = vision_search_photo.get("feeds") or []
+                remaining = requested_count - collected_count
+                selected_feeds = feeds[:remaining]
+                for video_detail in selected_feeds:
+                    video_id = video_detail.get("photo", {}).get("id")
+                    if video_id:
+                        video_id_list.append(video_id)
                     await kuaishou_store.update_kuaishou_video(video_item=video_detail)
+                collected_count += len(selected_feeds)
 
                 # batch fetch video comments
                 page += 1
@@ -181,6 +215,8 @@ class KuaishouCrawler(AbstractCrawler):
                 utils.logger.info(f"[KuaishouCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
 
                 await self.batch_get_video_comments(video_id_list)
+                if not feeds:
+                    break
 
     async def get_specified_videos(self):
         """Get the information and comments of the specified post"""
@@ -230,6 +266,11 @@ class KuaishouCrawler(AbstractCrawler):
             except KeyError as ex:
                 utils.logger.error(
                     f"[KuaishouCrawler.get_video_info_task] have not fund video detail video_id:{video_id}, err: {ex}"
+                )
+                return None
+            except Exception as ex:
+                utils.logger.error(
+                    f"[KuaishouCrawler.get_video_info_task] Skip video_id:{video_id} after detail request error: {ex}"
                 )
                 return None
 
@@ -302,6 +343,24 @@ class KuaishouCrawler(AbstractCrawler):
                     urls=self.cookie_urls,
                 )
 
+    async def get_comment_count_task(
+        self, video_id: str, semaphore: asyncio.Semaphore
+    ) -> Optional[int]:
+        """Fetch only comment total without storing comment rows."""
+        async with semaphore:
+            try:
+                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                count = await self.ks_client.get_video_comment_count(video_id)
+                utils.logger.info(
+                    f"[KuaishouCrawler.get_comment_count_task] video_id:{video_id}, comment_count:{count}"
+                )
+                return count
+            except Exception as ex:
+                utils.logger.warning(
+                    f"[KuaishouCrawler.get_comment_count_task] Skip comment count for video_id:{video_id}, error:{ex}"
+                )
+                return None
+
     async def create_ks_client(self, httpx_proxy: Optional[str]) -> KuaiShouClient:
         """Create ks client"""
         utils.logger.info(
@@ -325,6 +384,20 @@ class KuaishouCrawler(AbstractCrawler):
             proxy_ip_pool=self.ip_proxy_pool,  # Pass proxy pool for automatic refresh
         )
         return ks_client_obj
+
+    async def browser_login_state_looks_valid(self) -> bool:
+        """Use the attached browser session as a fallback when the pong API is slow."""
+        try:
+            _, cookie_dict = await utils.convert_browser_context_cookies(
+                self.browser_context,
+                urls=self.cookie_urls,
+            )
+            return has_kuaishou_auth_cookie(cookie_dict)
+        except Exception as ex:
+            utils.logger.warning(
+                f"[KuaishouCrawler.browser_login_state_looks_valid] Could not verify browser login state: {ex}"
+            )
+            return False
 
     async def launch_browser(
         self,
@@ -435,9 +508,32 @@ class KuaishouCrawler(AbstractCrawler):
             for post_item in video_list
         ]
 
+        list_photo_by_id = {
+            post_item.get("photo", {}).get("id"): post_item.get("photo", {})
+            for post_item in video_list
+        }
         video_details = await asyncio.gather(*task_list)
         for video_detail in video_details:
             if video_detail is not None:
+                photo_info = video_detail.get("photo", {})
+                list_photo = list_photo_by_id.get(photo_info.get("id"), {})
+                if (
+                    not self.metric_value_present(photo_info.get("commentCount"))
+                    and self.metric_value_present(list_photo.get("commentCount"))
+                ):
+                    photo_info["commentCount"] = list_photo.get("commentCount")
+                if (
+                    os.environ.get(
+                        "MEDIACRAWLER_KS_COMMENT_COUNT_FALLBACK", ""
+                    ).lower()
+                    in {"1", "true", "yes"}
+                    and not self.metric_value_present(photo_info.get("commentCount"))
+                ):
+                    comment_count = await self.get_comment_count_task(
+                        photo_info.get("id"), semaphore
+                    )
+                    if comment_count is not None:
+                        photo_info["commentCount"] = comment_count
                 await kuaishou_store.update_kuaishou_video(video_detail)
 
     async def close(self):
