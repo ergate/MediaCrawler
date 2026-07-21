@@ -35,12 +35,32 @@ from cache.cache_factory import CacheFactory
 from tools import utils
 
 
+DOUYIN_AUTH_COOKIE_NAMES = {
+    "sessionid",
+    "sessionid_ss",
+    "sid_tt",
+    "sid_guard",
+    "uid_tt",
+    "uid_tt_ss",
+}
+
+
+def has_douyin_auth_cookie(cookie_dict: dict) -> bool:
+    """Ignore stale LOGIN_STATUS/localStorage markers and require a real session."""
+    return any(cookie_dict.get(name) for name in DOUYIN_AUTH_COOKIE_NAMES)
+
+
 class DouYinLogin(AbstractLogin):
     LOGIN_SURFACE_SELECTORS = (
         ("second verification", "#uc-second-verify"),
         ("QR code panel", "#animate_qrcode_container"),
         ("new login panel", "[id^='login-full-panel-']"),
         ("legacy login panel", "#login-panel-new"),
+    )
+    LOGIN_BUTTON_SELECTORS = (
+        "xpath=//p[normalize-space()='登录']",
+        "xpath=//button[normalize-space()='登录']",
+        "xpath=//*[contains(@class, 'login') and normalize-space()='登录']",
     )
 
     def __init__(self,
@@ -100,20 +120,7 @@ class DouYinLogin(AbstractLogin):
         """Check if the current login status is successful and return True otherwise return False"""
         current_cookie = await self.browser_context.cookies()
         _, cookie_dict = utils.convert_cookies(current_cookie)
-
-        for page in self.browser_context.pages:
-            try:
-                local_storage = await page.evaluate("() => window.localStorage")
-                if local_storage.get("HasUserLogin", "") == "1":
-                    return True
-            except Exception as e:
-                # utils.logger.warn(f"[DouYinLogin] check_login_state waring: {e}")
-                await asyncio.sleep(0.1)
-
-        if cookie_dict.get("LOGIN_STATUS") == "1":
-            return True
-
-        return False
+        return has_douyin_auth_cookie(cookie_dict)
 
     async def popup_login_dialog(self):
         """If the login dialog box does not pop up automatically, we will manually click the login button"""
@@ -129,19 +136,29 @@ class DouYinLogin(AbstractLogin):
         utils.logger.info(
             "[DouYinLogin.popup_login_dialog] Login surface is not visible; click the login button"
         )
-        login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']")
-        try:
-            await login_button_ele.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            # The login panel can appear while Playwright is retrying the click.
-            surface = await self.visible_login_surface()
-            if surface:
-                utils.logger.info(
-                    f"[DouYinLogin.popup_login_dialog] Detected active {surface} after click was intercepted"
-                )
+        last_error = None
+        for selector in self.LOGIN_BUTTON_SELECTORS:
+            login_button_ele = self.context_page.locator(selector)
+            try:
+                if (
+                    await login_button_ele.count() == 0
+                    or not await login_button_ele.first.is_visible(timeout=1000)
+                ):
+                    continue
+                await login_button_ele.first.click(timeout=10_000)
+                await asyncio.sleep(0.5)
                 return
-            raise
-        await asyncio.sleep(0.5)
+            except PlaywrightTimeoutError as ex:
+                last_error = ex
+                surface = await self.visible_login_surface()
+                if surface:
+                    utils.logger.info(
+                        f"[DouYinLogin.popup_login_dialog] Detected active {surface} after click was intercepted"
+                    )
+                    return
+        raise RuntimeError(
+            "Douyin login button was not found or could not be clicked"
+        ) from last_error
 
     async def visible_login_surface(self) -> str:
         """Return the currently visible login or verification surface."""

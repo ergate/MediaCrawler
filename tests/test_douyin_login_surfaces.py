@@ -3,7 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from media_platform.douyin.login import DouYinLogin
+from media_platform.douyin.client import DouYinClient
+from media_platform.douyin.login import DouYinLogin, has_douyin_auth_cookie
 
 
 def make_login(page):
@@ -40,3 +41,42 @@ async def test_qrcode_login_waits_for_second_verification(monkeypatch):
         state="hidden",
         timeout=1000,
     )
+
+
+def test_stale_markers_are_not_douyin_login_state():
+    assert not has_douyin_auth_cookie({"LOGIN_STATUS": "1"})
+    assert has_douyin_auth_cookie({"sessionid_ss": "real-session"})
+
+
+@pytest.mark.asyncio
+async def test_pong_rejects_stale_local_storage_login_marker():
+    page = MagicMock()
+    page.evaluate = AsyncMock(return_value={"HasUserLogin": "1"})
+    browser_context = MagicMock()
+    browser_context.cookies = AsyncMock(
+        return_value=[{"name": "LOGIN_STATUS", "value": "1"}]
+    )
+    client = DouYinClient(
+        headers={},
+        playwright_page=page,
+        cookie_dict={},
+    )
+
+    assert not await client.pong(browser_context)
+
+
+@pytest.mark.asyncio
+async def test_pong_accepts_real_session_cookie():
+    page = MagicMock()
+    browser_context = MagicMock()
+    browser_context.cookies = AsyncMock(
+        return_value=[{"name": "sessionid", "value": "real-session"}]
+    )
+    client = DouYinClient(
+        headers={},
+        playwright_page=page,
+        cookie_dict={},
+    )
+
+    assert await client.pong(browser_context)
+    page.evaluate.assert_not_called()

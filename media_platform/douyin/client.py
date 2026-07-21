@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 from .exception import *
 from .field import *
 from .help import *
+from .login import has_douyin_auth_cookie
 
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
@@ -208,15 +209,27 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         return await self.request(method="POST", url=f"{self._host}{uri}", data=data, headers=headers)
 
     async def pong(self, browser_context: BrowserContext) -> bool:
-        local_storage = await self.playwright_page.evaluate("() => window.localStorage")
-        if local_storage.get("HasUserLogin", "") == "1":
-            return True
-
         _, cookie_dict = await utils.convert_browser_context_cookies(
             browser_context,
             urls=self.cookie_urls,
         )
-        return cookie_dict.get("LOGIN_STATUS") == "1"
+        is_authenticated = has_douyin_auth_cookie(cookie_dict)
+        if not is_authenticated and (
+            cookie_dict.get("LOGIN_STATUS") == "1"
+            or await self._local_storage_claims_login()
+        ):
+            utils.logger.info(
+                "[DouYinClient.pong] Ignoring stale LOGIN_STATUS/HasUserLogin marker; "
+                "no Douyin session cookie was found"
+            )
+        return is_authenticated
+
+    async def _local_storage_claims_login(self) -> bool:
+        try:
+            local_storage = await self.playwright_page.evaluate("() => window.localStorage")
+            return local_storage.get("HasUserLogin", "") == "1"
+        except Exception:
+            return False
 
     async def update_cookies(self, browser_context: BrowserContext, urls: Optional[list[str]] = None):
         cookie_str, cookie_dict = await utils.convert_browser_context_cookies(
