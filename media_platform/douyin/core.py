@@ -37,7 +37,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
-from var import crawler_type_var, source_keyword_var
+from var import crawler_type_var, source_creator_var, source_keyword_var
 
 from .client import DouYinClient
 from .exception import DataFetchError
@@ -120,6 +120,13 @@ class DouYinCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+            if self.context_page.is_closed():
+                raise RuntimeError("Douyin browser readiness check failed: page is closed")
+            await self.context_page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=int(os.environ.get("MEDIACRAWLER_BROWSER_READY_TIMEOUT", "15000")),
+            )
+            utils.logger.info("[BrowserReady] Douyin browser, page, and login flow are ready; collection may start")
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -284,6 +291,7 @@ class DouYinCrawler(AbstractCrawler):
         utils.logger.info("[DouYinCrawler.get_creators_and_videos] Parsing creator URLs...")
 
         for creator_url in config.DY_CREATOR_ID_LIST:
+            source_creator_var.set(creator_url)
             try:
                 creator_info_parsed = parse_creator_info_from_url(creator_url)
                 user_id = creator_info_parsed.sec_user_id

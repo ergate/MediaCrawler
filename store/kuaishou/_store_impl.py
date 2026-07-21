@@ -38,7 +38,7 @@ from base.base_crawler import AbstractStore
 from database.db_session import get_session
 from database.models import KuaishouVideo, KuaishouVideoComment
 from tools import utils, words
-from var import crawler_type_var
+from var import crawler_type_var, source_creator_var
 from database.mongodb_store_base import MongoDBStoreBase
 
 
@@ -173,7 +173,10 @@ class KuaishouJsonlStoreImplement(AbstractStore):
         self.writer = AsyncFileWriter(platform="kuaishou", crawler_type=crawler_type_var.get())
 
     async def store_content(self, content_item: Dict):
-        await self.writer.write_to_jsonl(item_type="contents", item=content_item)
+        await self.writer.write_to_jsonl(
+            item_type="contents",
+            item={**content_item, "source_creator": source_creator_var.get()},
+        )
 
     async def store_comment(self, comment_item: Dict):
         await self.writer.write_to_jsonl(item_type="comments", item=comment_item)

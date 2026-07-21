@@ -40,7 +40,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import kuaishou as kuaishou_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
-from var import comment_tasks_var, crawler_type_var, source_keyword_var
+from var import comment_tasks_var, crawler_type_var, source_creator_var, source_keyword_var
 
 from .client import KuaiShouClient
 from .exception import DataFetchError
@@ -142,6 +142,14 @@ class KuaishouCrawler(AbstractCrawler):
                         browser_context=self.browser_context,
                         urls=self.cookie_urls,
                     )
+
+            if self.context_page.is_closed():
+                raise RuntimeError("Kuaishou browser readiness check failed: page is closed")
+            await self.context_page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=int(os.environ.get("MEDIACRAWLER_BROWSER_READY_TIMEOUT", "15000")),
+            )
+            utils.logger.info("[BrowserReady] Kuaishou browser, page, and login flow are ready; collection may start")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -472,6 +480,7 @@ class KuaishouCrawler(AbstractCrawler):
             "[KuaiShouCrawler.get_creators_and_videos] Begin get kuaishou creators"
         )
         for creator_url in config.KS_CREATOR_ID_LIST:
+            source_creator_var.set(creator_url)
             try:
                 # Parse creator URL to get user_id
                 creator_info: CreatorUrlInfo = parse_creator_info_from_url(creator_url)

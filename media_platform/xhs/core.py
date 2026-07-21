@@ -39,7 +39,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
-from var import crawler_type_var, source_keyword_var
+from var import crawler_type_var, source_creator_var, source_keyword_var
 
 from .client import XiaoHongShuClient
 from .exception import DataFetchError, NoteNotFoundError
@@ -110,6 +110,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+
+            if self.context_page.is_closed():
+                raise RuntimeError("Xiaohongshu browser readiness check failed: page is closed")
+            await self.context_page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=int(os.environ.get("MEDIACRAWLER_BROWSER_READY_TIMEOUT", "15000")),
+            )
+            utils.logger.info("[BrowserReady] Xiaohongshu browser, page, and login flow are ready; collection may start")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -189,6 +197,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """Get creator's notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.get_creators_and_notes] Begin get Xiaohongshu creators")
         for creator_url in config.XHS_CREATOR_ID_LIST:
+            source_creator_var.set(creator_url)
             try:
                 # Parse creator URL to get user_id and security tokens
                 creator_info: CreatorUrlInfo = parse_creator_info_from_url(creator_url)

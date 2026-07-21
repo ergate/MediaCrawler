@@ -36,7 +36,7 @@ from database.db_session import get_session
 from database.models import DouyinAweme, DouyinAwemeComment
 from tools import utils, words
 from tools.async_file_writer import AsyncFileWriter
-from var import crawler_type_var
+from var import crawler_type_var, source_creator_var
 from database.mongodb_store_base import MongoDBStoreBase
 
 
@@ -197,7 +197,7 @@ class DouyinJsonlStoreImplement(AbstractStore):
 
     async def store_content(self, content_item: Dict):
         await self.file_writer.write_to_jsonl(
-            item=content_item,
+            item={**content_item, "source_creator": source_creator_var.get()},
             item_type="contents"
         )
 
