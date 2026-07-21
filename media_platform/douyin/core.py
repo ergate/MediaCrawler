@@ -37,6 +37,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
+from tools.creator_progress import emit_creator_progress
 from var import crawler_type_var, source_creator_var, source_keyword_var
 
 from .client import DouYinClient
@@ -290,8 +291,10 @@ class DouYinCrawler(AbstractCrawler):
         utils.logger.info("[DouYinCrawler.get_creators_and_videos] Begin get douyin creators")
         utils.logger.info("[DouYinCrawler.get_creators_and_videos] Parsing creator URLs...")
 
-        for creator_url in config.DY_CREATOR_ID_LIST:
+        creator_urls = config.DY_CREATOR_ID_LIST
+        for creator_index, creator_url in enumerate(creator_urls, start=1):
             source_creator_var.set(creator_url)
+            emit_creator_progress("dy", creator_index, len(creator_urls), "started", creator_url)
             try:
                 creator_info_parsed = parse_creator_info_from_url(creator_url)
                 user_id = creator_info_parsed.sec_user_id
@@ -339,6 +342,7 @@ class DouYinCrawler(AbstractCrawler):
 
             video_ids = [video_item.get("aweme_id") for video_item in all_video_list]
             await self.batch_get_note_comments(video_ids)
+            emit_creator_progress("dy", creator_index, len(creator_urls), "completed", creator_url)
 
     async def fetch_creator_video_detail(self, video_list: List[Dict]):
         """

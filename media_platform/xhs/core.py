@@ -39,6 +39,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
+from tools.creator_progress import emit_creator_progress
 from var import crawler_type_var, source_creator_var, source_keyword_var
 
 from .client import XiaoHongShuClient
@@ -196,8 +197,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.get_creators_and_notes] Begin get Xiaohongshu creators")
-        for creator_url in config.XHS_CREATOR_ID_LIST:
+        creator_urls = config.XHS_CREATOR_ID_LIST
+        for creator_index, creator_url in enumerate(creator_urls, start=1):
             source_creator_var.set(creator_url)
+            emit_creator_progress("xhs", creator_index, len(creator_urls), "started", creator_url)
             try:
                 # Parse creator URL to get user_id and security tokens
                 creator_info: CreatorUrlInfo = parse_creator_info_from_url(creator_url)
@@ -233,6 +236,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_ids.append(note_item.get("note_id"))
                 xsec_tokens.append(note_item.get("xsec_token"))
             await self.batch_get_note_comments(note_ids, xsec_tokens)
+            emit_creator_progress("xhs", creator_index, len(creator_urls), "completed", creator_url)
 
     async def fetch_creator_notes_detail(self, note_list: List[Dict]):
         """Concurrently obtain the specified post list and save the data"""
