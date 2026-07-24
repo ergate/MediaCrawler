@@ -481,35 +481,52 @@ class KuaishouCrawler(AbstractCrawler):
             "[KuaiShouCrawler.get_creators_and_videos] Begin get kuaishou creators"
         )
         creator_urls = config.KS_CREATOR_ID_LIST
+        creator_timeout = max(
+            10.0,
+            float(os.environ.get("MEDIACRAWLER_KS_CREATOR_TIMEOUT") or "180"),
+        )
         for creator_index, creator_url in enumerate(creator_urls, start=1):
             source_creator_var.set(creator_url)
             emit_creator_progress("ks", creator_index, len(creator_urls), "started", creator_url)
             try:
-                # Parse creator URL to get user_id
-                creator_info: CreatorUrlInfo = parse_creator_info_from_url(creator_url)
-                utils.logger.info(f"[KuaiShouCrawler.get_creators_and_videos] Parse creator URL info: {creator_info}")
-                user_id = creator_info.user_id
+                await asyncio.wait_for(
+                    self._collect_creator_videos(creator_url),
+                    timeout=creator_timeout,
+                )
+            except asyncio.TimeoutError:
+                utils.logger.error(
+                    f"[KuaiShouCrawler.get_creators_and_videos] Creator timed out "
+                    f"after {creator_timeout:g}s, skip: {creator_url}"
+                )
+            except Exception as e:
+                utils.logger.error(
+                    f"[KuaiShouCrawler.get_creators_and_videos] Creator failed, "
+                    f"skip: {creator_url}, error: {e}"
+                )
+            finally:
+                emit_creator_progress("ks", creator_index, len(creator_urls), "completed", creator_url)
 
-                # get creator detail info from web html content
-                createor_info: Dict = await self.ks_client.get_creator_info(user_id=user_id)
-                if createor_info:
-                    await kuaishou_store.save_creator(user_id, creator=createor_info)
-            except ValueError as e:
-                utils.logger.error(f"[KuaiShouCrawler.get_creators_and_videos] Failed to parse creator URL: {e}")
-                continue
+    async def _collect_creator_videos(self, creator_url: str) -> None:
+        """Collect one creator without affecting the shared browser session."""
+        creator_info: CreatorUrlInfo = parse_creator_info_from_url(creator_url)
+        utils.logger.info(
+            f"[KuaiShouCrawler.get_creators_and_videos] Parse creator URL info: {creator_info}"
+        )
+        user_id = creator_info.user_id
 
-            # Get all video information of the creator
-            all_video_list = await self.ks_client.get_all_videos_by_creator(
-                user_id=user_id,
-                crawl_interval=config.CRAWLER_MAX_SLEEP_SEC,
-                callback=self.fetch_creator_video_detail,
-            )
+        creator = await self.ks_client.get_creator_info(user_id=user_id)
+        if creator:
+            await kuaishou_store.save_creator(user_id, creator=creator)
 
-            video_ids = [
-                video_item.get("photo", {}).get("id") for video_item in all_video_list
-            ]
-            await self.batch_get_video_comments(video_ids)
-            emit_creator_progress("ks", creator_index, len(creator_urls), "completed", creator_url)
+        all_video_list = await self.ks_client.get_all_videos_by_creator(
+            user_id=user_id,
+            crawl_interval=config.CRAWLER_MAX_SLEEP_SEC,
+            callback=self.fetch_creator_video_detail,
+        )
+        video_ids = [
+            video_item.get("photo", {}).get("id") for video_item in all_video_list
+        ]
+        await self.batch_get_video_comments(video_ids)
 
     async def fetch_creator_video_detail(self, video_list: List[Dict]):
         """
