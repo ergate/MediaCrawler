@@ -530,8 +530,17 @@ class KuaishouCrawler(AbstractCrawler):
 
     async def fetch_creator_video_detail(self, video_list: List[Dict]):
         """
-        Concurrently obtain the specified post list and save the data
+        Save creator profile works immediately. Optional detail enrichment must
+        never be required for the basic creator collection path.
         """
+        fetch_details = os.environ.get(
+            "MEDIACRAWLER_KS_FETCH_VIDEO_DETAIL", "false"
+        ).lower() in {"1", "true", "yes"}
+        if not fetch_details:
+            for video_item in video_list:
+                await kuaishou_store.update_kuaishou_video(video_item)
+            return
+
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         task_list = [
             self.get_video_info_task(post_item.get("photo", {}).get("id"), semaphore)
