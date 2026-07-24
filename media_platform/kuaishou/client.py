@@ -423,6 +423,7 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
         min_publish_ts = int(os.environ.get("MEDIACRAWLER_MIN_PUBLISH_TS") or "0")
         max_count = max(int(config.CRAWLER_MAX_NOTES_COUNT), 1)
         while pcursor != "no_more" and len(result) < max_count:
+            request_pcursor = pcursor
             videos_res = await self.get_video_by_creater(user_id, pcursor)
             if not videos_res:
                 utils.logger.error(
@@ -431,12 +432,17 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
                 break
 
             vision_profile_photo_list = videos_res.get("visionProfilePhotoList", {})
-            pcursor = vision_profile_photo_list.get("pcursor", "")
+            next_pcursor = vision_profile_photo_list.get("pcursor", "")
 
             videos = vision_profile_photo_list.get("feeds", []) or []
             utils.logger.info(
                 f"[KuaiShouClient.get_all_videos_by_creator] got user_id:{user_id} videos len : {len(videos)}"
             )
+            if not videos:
+                utils.logger.warning(
+                    f"[KuaiShouClient.get_all_videos_by_creator] Empty creator feed, stop pagination for user_id:{user_id}"
+                )
+                break
 
             filtered_videos: List[Dict] = []
             older_seen = False
@@ -456,4 +462,10 @@ class KuaiShouClient(AbstractApiClient, ProxyRefreshMixin):
             result.extend(filtered_videos)
             if older_seen:
                 break
+            if not next_pcursor or next_pcursor == request_pcursor:
+                utils.logger.warning(
+                    f"[KuaiShouClient.get_all_videos_by_creator] Creator cursor did not advance, stop pagination for user_id:{user_id}"
+                )
+                break
+            pcursor = next_pcursor
         return result
