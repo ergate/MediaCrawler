@@ -483,7 +483,7 @@ class KuaishouCrawler(AbstractCrawler):
         creator_urls = config.KS_CREATOR_ID_LIST
         creator_timeout = max(
             10.0,
-            float(os.environ.get("MEDIACRAWLER_KS_CREATOR_TIMEOUT") or "180"),
+            float(os.environ.get("MEDIACRAWLER_KS_CREATOR_TIMEOUT") or "600"),
         )
         for creator_index, creator_url in enumerate(creator_urls, start=1):
             source_creator_var.set(creator_url)

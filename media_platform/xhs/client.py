@@ -18,6 +18,7 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import os
 import json
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
@@ -615,6 +616,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         result = []
         notes_has_more = True
         notes_cursor = ""
+        min_publish_ts = int(os.environ.get("MEDIACRAWLER_MIN_PUBLISH_TS") or "0")
         while notes_has_more and len(result) < config.CRAWLER_MAX_NOTES_COUNT:
             notes_res = await self.get_notes_by_creator(
                 user_id, notes_cursor, xsec_token=xsec_token, xsec_source=xsec_source
@@ -642,12 +644,38 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             if remaining <= 0:
                 break
 
-            notes_to_add = notes[:remaining]
+            notes_to_add = []
+            older_seen = False
+            for note in notes:
+                publish_ts = 0
+                for field in ("time", "timestamp", "create_time", "createTime"):
+                    try:
+                        value = int(note.get(field) or 0)
+                    except (TypeError, ValueError):
+                        value = 0
+                    if value:
+                        publish_ts = int(value / 1000) if value > 10_000_000_000 else value
+                        break
+                if not publish_ts:
+                    note_id = str(note.get("note_id") or note.get("id") or "")
+                    if len(note_id) >= 8:
+                        try:
+                            publish_ts = int(note_id[:8], 16)
+                        except ValueError:
+                            publish_ts = 0
+                if min_publish_ts and publish_ts and publish_ts < min_publish_ts:
+                    older_seen = True
+                    continue
+                notes_to_add.append(note)
+                if len(notes_to_add) >= remaining:
+                    break
             if callback:
                 await callback(notes_to_add)
 
             result.extend(notes_to_add)
             await asyncio.sleep(crawl_interval)
+            if older_seen:
+                break
 
         utils.logger.info(
             f"[XiaoHongShuClient.get_all_notes_by_creator] Finished getting notes for user {user_id}, total: {len(result)}"

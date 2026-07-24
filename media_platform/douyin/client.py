@@ -19,6 +19,7 @@
 
 import asyncio
 import copy
+import os
 import json
 import re
 import urllib.parse
@@ -415,17 +416,33 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         posts_has_more = 1
         max_cursor = ""
         result = []
+        min_publish_ts = int(os.environ.get("MEDIACRAWLER_MIN_PUBLISH_TS") or "0")
         while posts_has_more == 1 and (max_count <= 0 or len(result) < max_count):
             aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor)
             posts_has_more = aweme_post_res.get("has_more", 0)
             next_cursor = aweme_post_res.get("max_cursor")
             aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
+            older_seen = False
+            if min_publish_ts:
+                recent_awemes = []
+                for aweme in aweme_list:
+                    try:
+                        publish_ts = int(aweme.get("create_time") or 0)
+                    except (TypeError, ValueError):
+                        publish_ts = 0
+                    if publish_ts and publish_ts < min_publish_ts:
+                        older_seen = True
+                        continue
+                    recent_awemes.append(aweme)
+                aweme_list = recent_awemes
             if max_count > 0:
                 aweme_list = aweme_list[: max_count - len(result)]
             utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
             if callback:
                 await callback(aweme_list)
             result.extend(aweme_list)
+            if older_seen:
+                break
             if posts_has_more == 1 and next_cursor == max_cursor and not aweme_list:
                 utils.logger.warning(
                     "[DouYinClient.get_all_user_aweme_posts] Empty page with unchanged "
