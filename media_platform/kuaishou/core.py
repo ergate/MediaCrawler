@@ -543,28 +543,31 @@ class KuaishouCrawler(AbstractCrawler):
             for post_item in video_list
         }
         video_details = await asyncio.gather(*task_list)
-        for video_detail in video_details:
-            if video_detail is not None:
-                photo_info = video_detail.get("photo", {})
-                list_photo = list_photo_by_id.get(photo_info.get("id"), {})
-                if (
-                    not self.metric_value_present(photo_info.get("commentCount"))
-                    and self.metric_value_present(list_photo.get("commentCount"))
-                ):
-                    photo_info["commentCount"] = list_photo.get("commentCount")
-                if (
-                    os.environ.get(
-                        "MEDIACRAWLER_KS_COMMENT_COUNT_FALLBACK", ""
-                    ).lower()
-                    in {"1", "true", "yes"}
-                    and not self.metric_value_present(photo_info.get("commentCount"))
-                ):
-                    comment_count = await self.get_comment_count_task(
-                        photo_info.get("id"), semaphore
-                    )
-                    if comment_count is not None:
-                        photo_info["commentCount"] = comment_count
-                await kuaishou_store.update_kuaishou_video(video_detail)
+        for list_item, video_detail in zip(video_list, video_details):
+            # The profile feed already contains a convertible work. Kuaishou
+            # may reject the secondary detail request even when the profile
+            # request succeeded, so retain the list item as a fallback.
+            resolved_detail = video_detail if isinstance(video_detail, dict) else list_item
+            photo_info = resolved_detail.get("photo", {})
+            list_photo = list_photo_by_id.get(photo_info.get("id"), {})
+            if (
+                not self.metric_value_present(photo_info.get("commentCount"))
+                and self.metric_value_present(list_photo.get("commentCount"))
+            ):
+                photo_info["commentCount"] = list_photo.get("commentCount")
+            if (
+                os.environ.get(
+                    "MEDIACRAWLER_KS_COMMENT_COUNT_FALLBACK", ""
+                ).lower()
+                in {"1", "true", "yes"}
+                and not self.metric_value_present(photo_info.get("commentCount"))
+            ):
+                comment_count = await self.get_comment_count_task(
+                    photo_info.get("id"), semaphore
+                )
+                if comment_count is not None:
+                    photo_info["commentCount"] = comment_count
+            await kuaishou_store.update_kuaishou_video(resolved_detail)
 
     async def close(self):
         """Close browser context"""
