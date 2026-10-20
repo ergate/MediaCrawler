@@ -22,6 +22,40 @@ import re
 from typing import Dict, Optional
 
 import humps
+from parsel import Selector
+from tools import utils
+
+
+def extract_initial_state(html: str) -> Optional[Dict]:
+    for script in Selector(text=html).xpath('//script/text()').getall():
+        match = re.search(r'window\.__INITIAL_STATE__\s*=\s*', script)
+        if not match:
+            continue
+        state = script[match.end():].lstrip()
+        # Preserve quoted text; only JavaScript's bare undefined becomes null.
+        state = re.sub(
+            r'"(?:\\.|[^"\\])*"|(?<![\w$])undefined(?![\w$])',
+            lambda token: 'null' if token.group(0) == 'undefined' else token.group(0),
+            state,
+        )
+        try:
+            value, _ = json.JSONDecoder().raw_decode(state)
+        except json.JSONDecodeError as exc:
+            # Keep syntax/position evidence without note text, cookies or tokens.
+            masked = re.sub(r'"(?:\\.|[^"\\])*"', lambda token: '"' + 'x' * (len(token.group()) - 2) + '"', state)
+            masked = re.sub(r'[\w$]', 'x', masked)
+            literal = re.match(r'[A-Za-z_$][\w$]*', state[exc.pos:])
+            literal = literal.group() if literal else ""
+            literal = literal if literal in {"undefined", "void", "NaN", "Infinity", "new"} else "other"
+            utils.logger.error("[XhsResponseDiagnostic] " + json.dumps({
+                "stage": "html-initial-state", "error": "JSONDecodeError",
+                "position": exc.pos, "line": exc.lineno, "column": exc.colno,
+                "length": len(state), "literalAtError": literal,
+                "syntax": masked[max(0, exc.pos - 30):exc.pos + 50],
+            }))
+            raise
+        return value if isinstance(value, dict) else None
+    return None
 
 
 class XiaoHongShuExtractor:
@@ -41,12 +75,11 @@ class XiaoHongShuExtractor:
             # Either a CAPTCHA appeared or the note doesn't exist
             return None
 
-        state = re.findall(r"window.__INITIAL_STATE__=({.*})</script>", html)[
-            0
-        ].replace("undefined", '""')
-        if state != "{}":
-            note_dict = humps.decamelize(json.loads(state))
-            return note_dict["note"]["note_detail_map"][note_id]["note"]
+        state = extract_initial_state(html)
+        if state:
+            note = state.get("note") or {}
+            entry = (note.get("noteDetailMap") or {}).get(note_id) or {}
+            return humps.decamelize(entry["note"]) if entry.get("note") else None
         return None
 
     def extract_creator_info_from_html(self, html: str) -> Optional[Dict]:
@@ -58,12 +91,5 @@ class XiaoHongShuExtractor:
         Returns:
             Dict: User information dictionary
         """
-        match = re.search(
-            r"<script>window.__INITIAL_STATE__=(.+)<\/script>", html, re.M
-        )
-        if match is None:
-            return None
-        info = json.loads(match.group(1).replace(":undefined", ":null"), strict=False)
-        if info is None:
-            return None
-        return info.get("user").get("userPageData")
+        info = extract_initial_state(html)
+        return (info.get("user") or {}).get("userPageData") if info else None

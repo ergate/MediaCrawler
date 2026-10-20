@@ -18,6 +18,7 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import json
 import os
 import random
 from asyncio import Task
@@ -62,6 +63,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self.detail_parse_failures = 0
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -220,7 +222,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 continue
 
             # Use fixed crawling interval
-            crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+            crawl_interval = max(8, config.CRAWLER_MAX_SLEEP_SEC)
             # Get all note information of the creator
             all_notes_list = await self.xhs_client.get_all_notes_by_creator(
                 user_id=user_id,
@@ -239,19 +241,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
             emit_creator_progress("xhs", creator_index, len(creator_urls), "completed", creator_url)
 
     async def fetch_creator_notes_detail(self, note_list: List[Dict]):
-        """Concurrently obtain the specified post list and save the data"""
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [
-            self.get_note_detail_async_task(
+        """Save each note before fetching the next; a late failure cannot lose the page."""
+        semaphore = asyncio.Semaphore(1)
+        for post_item in note_list:
+            note_detail = await self.get_note_detail_async_task(
                 note_id=post_item.get("note_id"),
                 xsec_source=post_item.get("xsec_source"),
                 xsec_token=post_item.get("xsec_token"),
                 semaphore=semaphore,
-            ) for post_item in note_list
-        ]
-
-        note_details = await asyncio.gather(*task_list)
-        for note_detail in note_details:
+            )
             if note_detail:
                 await xhs_store.update_xhs_note(note_detail)
                 await self.get_notice_media(note_detail)
@@ -308,33 +306,52 @@ class XiaoHongShuCrawler(AbstractCrawler):
             try:
                 try:
                     note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
-                except RetryError:
-                    pass
+                except json.JSONDecodeError:
+                    # One normal HTML read is permitted only after an unblocked response.
+                    await asyncio.sleep(max(8, config.CRAWLER_MAX_SLEEP_SEC))
+                except RetryError as ex:
+                    cause = ex.last_attempt.exception()
+                    if not isinstance(cause, json.JSONDecodeError):
+                        raise cause from ex
 
                 if not note_detail:
                     note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
                                                                                  enable_cookie=True)
                     if not note_detail:
-                        utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
-                        return None
+                        raise DataFetchError(f"XHS detail unavailable in API and HTML, note_id:{note_id}")
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
+                self.detail_parse_failures = 0
 
                 # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                interval = max(8, config.CRAWLER_MAX_SLEEP_SEC)
+                await asyncio.sleep(interval)
+                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {interval} seconds after fetching note {note_id}")
 
                 return note_detail
 
+            except (json.JSONDecodeError, RetryError) as ex:
+                cause = ex.last_attempt.exception() if isinstance(ex, RetryError) else ex
+                if not isinstance(cause, json.JSONDecodeError):
+                    raise
+                utils.logger.error("[NoteParseError] " + json.dumps({
+                    "source": source_creator_var.get(),
+                    "note_id": note_id,
+                    "error": "JSONDecodeError",
+                }, ensure_ascii=False))
+                self.detail_parse_failures += 1
+                if self.detail_parse_failures >= 2:
+                    raise DataFetchError("XHS stopped after two consecutive detail parsing failures") from None
+                await asyncio.sleep(max(8, config.CRAWLER_MAX_SLEEP_SEC))
+                return None
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
                 return None
             except DataFetchError as ex:
-                utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error: {ex}")
-                return None
+                # A failed read is not evidence that the account has no published notes.
+                raise
             except KeyError as ex:
-                utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
-                return None
+                raise DataFetchError(f"XHS note detail schema invalid, note_id:{note_id}") from ex
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""

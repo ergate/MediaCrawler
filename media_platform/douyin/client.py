@@ -153,7 +153,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
-        if response.text.strip() in {"", "blocked"}:
+        self._check_access_response(response)
+        if response.text.strip() == "":
             utils.logger.warning(
                 "[DouYinClient.request] httpx returned empty/blocked response "
                 f"(status={response.status_code}); retrying with requests transport"
@@ -169,6 +170,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 raise DataFetchError(
                     f"Douyin requests transport failed: {type(ex).__name__}: {ex}"
                 ) from ex
+            self._check_access_response(response)
         try:
             if response.text.strip() in {"", "blocked"}:
                 utils.logger.error(
@@ -179,6 +181,15 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             return response.json()
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
+
+    @staticmethod
+    def _check_access_response(response):
+        body = response.text.strip().lower()
+        if response.status_code == 401:
+            raise DataFetchError("Login required (HTTP 401)")
+        if response.status_code in {403, 429} or body == "blocked" or "argussecurityplugin" in body:
+            detail = "Uifid Not Found" if "uifid not found" in body else f"HTTP {response.status_code}"
+            raise DataFetchError(f"AccessRestricted: {detail}; stopping without transport retry")
 
     def _request_with_requests(self, method: str, url: str, kwargs: Dict):
         request_kwargs = {

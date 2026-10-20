@@ -21,11 +21,11 @@ import asyncio
 import os
 import json
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 from playwright.async_api import BrowserContext, Page
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_not_exception_type
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from tools.httpx_util import make_async_client
 
 import config
@@ -41,6 +41,10 @@ from .field import SearchNoteType, SearchSortType
 from .help import get_search_id
 from .extractor import XiaoHongShuExtractor
 from .playwright_sign import sign_with_xhshow
+
+
+class TransientResponseError(DataFetchError):
+    """A temporary server failure, not a login or parsing failure."""
 
 
 class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
@@ -113,7 +117,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.headers.update(headers)
         return self.headers
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_not_exception_type(NoteNotFoundError))
+    @retry(stop=stop_after_attempt(2), wait=wait_fixed(15),
+           retry=retry_if_exception_type((httpx.TransportError, TransientResponseError)), reraise=True)
     async def request(self, method, url, **kwargs) -> Union[str, Any]:
         """
         Wrapper for httpx common request method, processes request response
@@ -133,26 +138,49 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
 
-        if response.status_code == 471 or response.status_code == 461:
-            # someday someone maybe will bypass captcha
-            verify_type = response.headers["Verifytype"]
-            verify_uuid = response.headers["Verifyuuid"]
-            msg = f"CAPTCHA appeared, request failed, Verifytype: {verify_type}, Verifyuuid: {verify_uuid}, Response: {response}"
-            utils.logger.error(msg)
-            raise Exception(msg)
+        status = response.status_code
+        diagnostic = {
+            "stage": "html-response" if return_response else "api-response",
+            "path": urlsplit(url).path,
+            "status": status,
+            "contentType": response.headers.get("content-type", "").split(";")[0],
+            "bytes": len(response.content),
+        }
+        if status in (403, 429, 461, 471) or response.headers.get("Verifytype"):
+            utils.logger.error("[XhsResponseDiagnostic] " + json.dumps(diagnostic))
+            raise IPBlockError(f"AccessRestricted HTTP {status}; stop collection for manual review")
+        if status == 401:
+            raise DataFetchError("Login required (HTTP 401)")
+        if 500 <= status < 600:
+            raise TransientResponseError(f"XHS temporary server error HTTP {status}")
+        if not 200 <= status < 300:
+            raise DataFetchError(f"XHS unexpected response HTTP {status}")
 
         if return_response:
             return response.text
-        data: Dict = response.json()
+        try:
+            data: Dict = response.json()
+        except json.JSONDecodeError as exc:
+            diagnostic.update(error="JSONDecodeError", position=exc.pos, line=exc.lineno,
+                              column=exc.colno, empty=not bool(response.text.strip()),
+                              html=response.text.lstrip().startswith("<"))
+            utils.logger.error("[XhsResponseDiagnostic] " + json.dumps(diagnostic))
+            raise
+        if not isinstance(data, dict) or "success" not in data:
+            raise DataFetchError("XHS response schema invalid: success field missing")
         if data["success"]:
             return data.get("data", data.get("success", {}))
-        elif data["code"] == self.IP_ERROR_CODE:
+        elif data.get("code") == self.IP_ERROR_CODE:
             raise IPBlockError(self.IP_ERROR_STR)
-        elif data["code"] in (self.NOTE_NOT_FOUND_CODE, self.NOTE_ABNORMAL_CODE):
+        elif data.get("code") in (self.NOTE_NOT_FOUND_CODE, self.NOTE_ABNORMAL_CODE):
             raise NoteNotFoundError(f"Note not found or abnormal, code: {data['code']}")
         else:
-            err_msg = data.get("msg", None) or f"{response.text}"
-            raise DataFetchError(err_msg)
+            message = str(data.get("msg") or "").lower()
+            if any(marker in message for marker in ("请先登录", "登录已过期", "login required", "login expired")):
+                raise DataFetchError("Login required: platform reported an invalid session")
+            if any(marker in message for marker in ("访问频繁", "请求过于频繁", "需要验证", "captcha", "access denied")):
+                raise IPBlockError("AccessRestricted: platform requires verification")
+            raise DataFetchError(f"XHS API rejected the request, code: {data.get('code')}")
 
     @staticmethod
     def _build_query_string(params: Dict) -> str:
@@ -342,9 +370,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             res_dict: Dict = res["items"][0]["note_card"]
             return res_dict
         # When crawling frequently, some notes may have results while others don't
-        utils.logger.error(
-            f"[XiaoHongShuClient.get_note_by_id] get note id:{note_id} empty and res:{res}"
-        )
+        utils.logger.warning(f"[XiaoHongShuClient.get_note_by_id] Empty note detail, note_id:{note_id}")
         return dict()
 
     async def get_note_comments(
@@ -695,7 +721,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         data = {"original_url": f"{self._domain}/discovery/item/{note_id}"}
         return await self.post(uri, data=data, return_response=True)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_note_by_id_from_html(
         self,
         note_id: str,
