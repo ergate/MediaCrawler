@@ -109,7 +109,7 @@ async def test_requests_fallback_failure_is_data_fetch_error(monkeypatch):
     client = _client()
     monkeypatch.setattr(
         "media_platform.douyin.client.make_async_client",
-        lambda **_kwargs: _AsyncClientContext(_Response("blocked")),
+        lambda **_kwargs: _AsyncClientContext(_Response("")),
     )
     monkeypatch.setattr(
         client,
